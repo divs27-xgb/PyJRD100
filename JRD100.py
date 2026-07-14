@@ -26,12 +26,13 @@ class JRD100exception(Exception):
 
 
 class reader():
-    def __init__(self, port="COM9", baud_rate=115200, debug=False):
+    def __init__(self, port, baud_rate=115200, debug=False, debug_callback=None):
         self.port = port
         self.baud_rate = baud_rate
         self.ser = serial.Serial(self.port, self.baud_rate)
         time.sleep(2)
         self.debug = debug
+        self.debug_callback = debug_callback
 
         self.response_queue = queue.Queue()
         self.notification_queue = queue.Queue()
@@ -42,6 +43,7 @@ class reader():
         self._thread.start()
 
     def _read_loop(self):
+        #Read the incoming data continouly and pushes it to the relevant queue
         buffer = bytearray()
         while self._running:
             b = self.ser.read(1)
@@ -54,7 +56,10 @@ class reader():
                 frame = bytes(buffer)
                 buffer = bytearray()
                 if self.debug:
-                    print("Recv: ", frame.hex(' ').upper())
+                    if self.debug_callback:
+                        self.debug_callback("RX", frame.hex(' ').upper())
+                    else:
+                        print("Recv: ", frame.hex(' ').upper())
                 if len(frame) >= 3 and frame[1] == 0x01 and frame[2] == 0xFF:
                     pl = (frame[3] << 8) | frame[4]
                     code = frame[5] if pl >= 1 else 0x00
@@ -68,14 +73,18 @@ class reader():
                     self.response_queue.put(frame)
 
     def _send(self, command):
+        #Send data on the serial port
         self.ser.write((command + "\n").encode())
         if self.debug:
-            print("Sent: ", command)
+            if self.debug_callback:
+                self.debug_callback("TX", command)
+            else:
+                print("Sent: ", command)
 
     def _get_response(self, timeout=2, resp=True):
+        #Fetch responses from the relevant queue
         try:
             error_frame = self.error_queue.get_nowait()
-            print("done")
         except queue.Empty:
             error_frame = None
         if error_frame is not None:
@@ -90,6 +99,7 @@ class reader():
             return None
 
     def _frame_comm(self, command, parameter=None):
+        #Frame the actual command based on the given command parameters
         if parameter:
             length = len(parameter.split())
             hex_len = f"{length:04X}"
@@ -129,11 +139,11 @@ class reader():
                 raise TimeoutError("No response from module")
             pl = (frame[3] << 8) | frame[4]
             data = frame[5:5 + pl]
+            return data.decode("ascii", errors="ignore")
+
         except JRD100exception as e:
             print(e)
             return None
-
-            return data.decode("ascii", errors="ignore")
 
     def getManufacturer(self):
         """Get manufacturer of the module"""
@@ -152,7 +162,8 @@ class reader():
             return None
 
     def SinglePoll(self):
-        """Single poll command"""
+        """Single poll command
+        :return tag_data"""
         try:
             final_comm = self._frame_comm(command="22")
             self._send(final_comm)
@@ -173,17 +184,16 @@ class reader():
         msb = f" {(polls >> 8) & 0xFF:02X}"
         lsb = f" {(polls & 0xFF):02X}"
         param = "22" + msb + lsb
-        print(param)
         final_comm = self._frame_comm(command="27", parameter=param)
         self._send(final_comm)
-        print(final_comm)
 
     def StopPoll(self):
         """Immediately Stop Multi poll command, Not a pause command"""
         final_comm = self._frame_comm(command="28")
-        return None
+        self._send(final_comm)
 
     def _construct_data(self, frame):
+        #Interprets the data and gives a structure to it for easier access
         pl = (frame[3] << 8) | frame[4]
         data = frame[5:5 + pl]
         # return data
@@ -209,6 +219,7 @@ class reader():
         Runs continuously until you break the loop or call StopPoll()
 
         Basic usage:
+        reader.MultiPoll()
         for tag in reader1.stream_tags():
             print(tag)
 
@@ -253,7 +264,7 @@ class reader():
     def setTransmitPower(self, power=2500):
         """
         Sets transmit power.
-        :param power:
+        :param power: Power to be set (max value 2600
         :return: None
             """
         try:
@@ -322,7 +333,7 @@ class reader():
         """
         mask: hex string of the EPC/data to filter on, e.g. "E200470... "
         membank: 0x00=RFU, 0x01=EPC, 0x02=TID, 0x03=User
-        ptr: bit offset to start comparing from (default 0x20 = right after CRC+PC)
+        ptr: bit offset to start comparing from (default 0x20 = right after CRC+PC,for reading EPC)
         target: 0x00-0x04 (which session/flag this Select affects)
         action: 0x00-0x07 (what happens to matching vs non-matching tags)
         truncate: 0x00=disabled, 0x80=enabled
@@ -384,9 +395,9 @@ class reader():
             print(f"Unexpected error: {e}")
             return None
 
-    def readTagMemoryArea(self, membank=1, access_password="00 00 00 00", start_offset=0, data_length=2):
+    def readTagMemoryArea(self, epc,membank=1, access_password="00 00 00 00", start_offset=0, data_length=2,):
         """Read tag memory area from specific bank
-
+        EPC: Tag to which the data should be writtem
         membank: 0=RFU, 1=EPC, 2=TID, 3=User (default=1)
         access_password: Tag access password in hex signed 2's complement (default=00 00 00 00)
         start_offset: Start offset in words (default=0)
@@ -394,15 +405,12 @@ class reader():
         note: 1 word = 2 bytes
 """
         try:
-            final_comm = self._frame_comm(command="0B")
-            self._send(final_comm)
-            frame1 = self._get_response(timeout=2, resp=True)
 
-            if frame1 is None:
-                raise TimeoutError("No response from module")
-            elif frame1[10] == 0x00:
-                raise Exception("Please SET SELECT PARAMETER before using read/write bank operations")
-
+            try:
+                self.setSelectParam(membank=1,mask=epc)
+            except Exception as e:
+                print(f"Unexpected error: {e}")
+                return None
             param = access_password + " " + f"{membank:02X}" + " " + f"{(start_offset >> 8) & 0xFF:02X}" + f" {start_offset & 0xFF:02X}" + f" {(data_length >> 8) & 0xFF:02X}" + f" {data_length & 0xFF:02X}"
             final_comm1 = self._frame_comm(command="39", parameter=param)
             # print(final_comm)
@@ -410,6 +418,7 @@ class reader():
             frame = self._get_response(timeout=2, resp=True)
 
             if frame is None:
+                self.setSelectMode()#cancels the select command
                 raise TimeoutError("No response from module")
             pl = (frame[3] << 8) | frame[4]
             pc = (frame[6] << 8) | frame[7]
@@ -424,11 +433,88 @@ class reader():
                     "pl": pl}
         except TimeoutError as e:
             print(e)
+            self.setSelectMode()
             return None
 
+    def writeTagMemoryArea(self, epc, data, membank=1, access_password="00 00 00 00", start_offset=0):
+        """Write data to a specific tag memory bank, after selecting the tag by its current EPC.
 
-reader1 = reader(debug=True)
-reader1.setSelectParam("A001")
-dat = reader1.readTagMemoryArea(membank=2, data_length=3)
-print(dat)
+        epc: current EPC of the tag to select (hex string)
+        data: hex string of the data to write
+        membank: 0=RFU, 1=EPC, 2=TID, 3=User (default=1)
+        access_password: tag access password, hex string (default="00 00 00 00")
+        start_offset: word offset to write at (default=0)
 
+        Special case: if membank==1 (EPC) and start_offset is 0 or 1, this assumes
+        you're overwriting the tag's actual EPC identity data. In that case:
+          - PC (word 1) is automatically recalculated to match the new EPC's length
+          - PC + new EPC are written together in one command, starting at word 1
+            (word 0, the CRC, is tag-managed and never written)
+          - after a successful write, the Select filter is automatically refreshed
+            to the NEW epc, since the old filter would otherwise go stale
+        """
+        try:
+            try:
+                self.setSelectParam(membank=1, mask=epc)
+            except Exception as e:
+                print(f"Unexpected error: {e}")
+                return None
+
+            data_bytes = bytes.fromhex(data.replace(" ", ""))
+            if len(data_bytes) % 2 != 0:
+                raise ValueError("Data length must be a whole number of words (even byte count)")
+
+            new_epc_bytes = None
+
+            if membank == 1 and start_offset <= 1:
+                new_epc_bytes = data_bytes
+                epc_len_words = len(new_epc_bytes) // 2
+
+                # Reuse the existing read function -- PC comes back on every read
+                # regardless of what bank/offset was requested
+                current = self.readTagMemoryArea(epc=epc, membank=1, start_offset=1, data_length=1)
+                if current is None:
+                    print("Could not read current PC, aborting EPC write")
+                    return None
+
+                old_pc = current["pc"]
+                other_bits = old_pc & 0x07FF  # preserve flag bits unrelated to length
+
+                new_pc = ((epc_len_words & 0x1F) << 11) | other_bits
+                pc_bytes = bytes([(new_pc >> 8) & 0xFF, new_pc & 0xFF])
+
+                write_bytes = pc_bytes + new_epc_bytes
+                write_start_offset = 1
+                write_length_words = 1 + epc_len_words
+            else:
+                write_bytes = data_bytes
+                write_start_offset = start_offset
+                write_length_words = len(data_bytes) // 2
+
+            param = (
+                    access_password + " " +
+                    f"{membank:02X}" + " " +
+                    f"{(write_start_offset >> 8) & 0xFF:02X} {write_start_offset & 0xFF:02X}" + " " +
+                    f"{(write_length_words >> 8) & 0xFF:02X} {write_length_words & 0xFF:02X}" + " " +
+                    write_bytes.hex(" ").upper()
+            )
+
+            final_comm = self._frame_comm(command="49", parameter=param)
+            self._send(final_comm)
+            frame = self._get_response(timeout=2, resp=True)
+
+            if frame is None:
+                raise TimeoutError("No response from module")
+
+            # Old Select filter is now stale if we just rewrote the EPC -- refresh it
+            if new_epc_bytes is not None:
+                try:
+                    self.setSelectParam(membank=1, mask=new_epc_bytes.hex().upper())
+                except Exception as e:
+                    print(f"Write succeeded, but re-select with new EPC failed: {e}")
+
+            return frame
+
+        except TimeoutError as e:
+            print(e)
+            return None
