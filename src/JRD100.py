@@ -2,7 +2,7 @@ import queue
 import threading
 import serial
 import time
-
+"""Core Wrapper file.Contains All the neccesary function that are used to interact with the module. Can be used as a standalone file in your prject """
 JRD100_ERROR_CODES = {
     0x09: "Tag not within field or the specified EPC is incorrect",
     0x16: "Access password incorrect",
